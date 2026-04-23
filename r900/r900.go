@@ -161,6 +161,8 @@ func (p Parser) quantize() {
 
 // Given a list of indices the preamble exists at, decode and parse a message.
 func (p *Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *sync.WaitGroup) {
+	defer wg.Done()
+
 	p.once.Do(func() {
 		p.cfg = p.Decoder.Cfg
 		p.signal = make([]float64, p.Decoder.Cfg.BufferLength)
@@ -170,8 +172,28 @@ func (p *Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *sy
 	})
 
 	cfg := p.cfg
+	// Always maintain the sliding window — later calls may need
+	// access to samples from this block when a packet straddles
+	// block boundaries. The copies are cheap (two memmoves).
 	copy(p.signal, p.signal[cfg.BlockSize:])
 	copy(p.signal[cfg.PacketLength:], p.Decoder.Signal[cfg.SymbolLength:])
+
+	// Fast-path: if the main decoder found no r900 preamble matches
+	// in this block, skip the expensive 4-FSK matched filter and
+	// quantize passes. Both are O(BufferLength) and dominate r900's
+	// per-block CPU cost (roughly 2.5M ops per block at default
+	// settings). In typical deployments preamble matches occur in
+	// <1% of blocks, so this skips almost all of r900's work when
+	// no meters are actively transmitting.
+	//
+	// Correctness: p.filtered and p.quantized are recomputed from
+	// p.signal on every call — they carry no cross-call state.
+	// As long as p.signal is kept current (see copies above), the
+	// next invocation with non-empty pkts will produce the correct
+	// filter output for the full window.
+	if len(pkts) == 0 {
+		return
+	}
 
 	p.filter()
 	p.quantize()
@@ -248,8 +270,6 @@ func (p *Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *sy
 
 		msgCh <- r900
 	}
-
-	wg.Done()
 }
 
 type R900 struct {
